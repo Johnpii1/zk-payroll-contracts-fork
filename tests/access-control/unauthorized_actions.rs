@@ -242,7 +242,11 @@ fn test_unauthorized_cancel_payroll_run_fails() {
     );
 
     // Attempt to cancel as unauthorized user
-    payroll_client.cancel_payroll_run(&unauthorized_user, &run_id, &soroban_sdk::Symbol::new(&env, "unauthorized"));
+    payroll_client.cancel_payroll_run(
+        &unauthorized_user,
+        &run_id,
+        &soroban_sdk::Symbol::new(&env, "unauthorized"),
+    );
 }
 
 /// Test that unauthorized users cannot commit draft hashes.
