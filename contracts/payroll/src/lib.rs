@@ -1,6 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, token as soroban_token, Address, BytesN, Env, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, token as soroban_token, Address, BytesN,
+    Env, Symbol, Vec,
 };
 
 use pause_manager::PauseManagerClient;
@@ -300,6 +301,8 @@ pub enum DataKey {
     CompanyBalance(Address),
     /// Marks a completed payroll run as archived for long-term reporting (#146).
     ArchivedRun(u64),
+    /// Asset allowlist entry for payroll settlement tokens (#200).
+    AllowedAsset(Address),
     /// Company lifecycle state gate for payroll execution (#147).
     CompanyState,
     /// Canonical payroll run state for SDK/dashboard conformance (#159).
@@ -976,7 +979,7 @@ impl Payroll {
     ///
     /// Issue #218: Added explicit validation that the run is still pending
     /// and proper state cleanup to prevent cancel-after-submit race conditions.
-    pub fn cancel_payroll_run(e: Env, admin: Address, run_id: u64) {
+    pub fn finalize_payroll_run(e: Env, admin: Address, run_id: u64) {
         Self::require_not_paused(&e);
         let addrs: ContractAddresses = e
             .storage()
@@ -1030,7 +1033,9 @@ impl Payroll {
     /// Cancel a pending payroll run without executing any payments (issue #198).
     ///
     /// Only the admin may cancel. The `reason` is recorded in the event for
-    /// audit trails. No funds are transferred; this is a pure cleanup operation.
+    /// audit trails. The reason must be a safe off-chain reference code, not
+    /// free-form payroll details. No funds are transferred; this is a pure
+    /// cleanup operation.
     ///
     /// Finalized runs cannot be cancelled retroactively. The run nonce remains
     /// permanently spent after cancellation (one-time-use for audit integrity).
@@ -1059,7 +1064,7 @@ impl Payroll {
             panic!("Cannot cancel a finalized payroll run");
         }
 
-        let pending_run: PendingPayrollRun = e
+        let _pending_run: PendingPayrollRun = e
             .storage()
             .persistent()
             .get(&pending_key)
@@ -1067,11 +1072,15 @@ impl Payroll {
 
         // Remove the pending run from storage
         e.storage().persistent().remove(&pending_key);
+        Self::record_payroll_run_state(&e, run_id, PayrollRunState::Cancelled);
 
-        // Emit cancellation event with reason for audit trail
+        // Emit cancellation event with a safe reason reference for audit trail.
+        // Do not include payroll amounts or employee-level values in rejection
+        // events; downstream systems can join the reason code to access-controlled
+        // review notes off-chain when needed.
         e.events().publish(
             (symbol_short!("payroll"), Symbol::new(&e, "run_cancelled")),
-            (run_id, pending_run.total_amount, reason),
+            (run_id, reason),
         );
     }
 
@@ -1395,6 +1404,21 @@ impl Payroll {
             ),
             (run_id, status),
         );
+
+        if status == ReconciliationStatus::Reconciled {
+            e.events().publish(
+                (
+                    symbol_short!("payroll"),
+                    Symbol::new(&e, "settlement_receipt"),
+                ),
+                (
+                    run_id,
+                    run.draft_hash.clone(),
+                    run.metadata_hash.clone(),
+                    Symbol::new(&e, "reconciled"),
+                ),
+            );
+        }
     }
 
     /// Finalize a `Pending` draft, making it permanently immutable.
@@ -1779,7 +1803,7 @@ mod tests {
     use proof_verifier::{ProofVerifier, VerificationKey};
     use salary_commitment::SalaryCommitmentContract;
     use soroban_sdk::testutils::{Address as _, Events as _};
-    use soroban_sdk::{Env, IntoVal};
+    use soroban_sdk::{Env, IntoVal, TryIntoVal};
 
     fn mock_proof(env: &Env) -> BytesN<256> {
         BytesN::from_array(env, &[0u8; 256])
@@ -2706,6 +2730,81 @@ mod tests {
     }
 
     #[test]
+    fn test_settlement_receipt_event_contains_references_without_private_values() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let draft_hash = BytesN::from_array(&env, &[0xA5u8; 32]);
+        payroll_client.commit_draft(&admin, &draft_hash);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 221),
+            &Some(draft_hash.clone()),
+        );
+        let run = payroll_client.get_payroll_run(&run_id);
+
+        let before = env.events().all().len();
+        payroll_client.update_reconciliation_status(
+            &admin,
+            &run_id,
+            &ReconciliationStatus::Reconciled,
+        );
+
+        let events = env.events().all();
+        assert_eq!(events.len(), before + 3);
+        let receipt_event = events.get(before + 2).unwrap();
+
+        let topic0: Symbol = receipt_event.1.get(0).unwrap().try_into_val(&env).unwrap();
+        let topic1: Symbol = receipt_event.1.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic0, symbol_short!("payroll"));
+        assert_eq!(topic1, Symbol::new(&env, "settlement_receipt"));
+
+        let payload: (u64, BytesN<32>, BytesN<32>, Symbol) =
+            receipt_event.2.try_into_val(&env).unwrap();
+        assert_eq!(
+            payload,
+            (
+                run_id,
+                draft_hash,
+                run.metadata_hash,
+                Symbol::new(&env, "reconciled")
+            )
+        );
+    }
+
+    #[test]
+    fn test_failed_settlement_does_not_emit_receipt_event() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 222),
+            &None,
+        );
+
+        let before = env.events().all().len();
+        payroll_client.update_reconciliation_status(&admin, &run_id, &ReconciliationStatus::Failed);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), before + 2);
+        let last_event = events.get(before + 1).unwrap();
+        let topic1: Symbol = last_event.1.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic1, Symbol::new(&env, "reconciliation_updated"));
+    }
+
+    #[test]
     fn test_failed_reconciliation_writes_retryable_payroll_state() {
         let env = Env::default();
         let (payroll_client, admin, _treasury, _treasury_owner, employee) =
@@ -2769,6 +2868,64 @@ mod tests {
     }
 
     // ── Issue #75: payroll cancellation ──────────────────────────────────────
+
+    #[test]
+    fn test_rejected_payroll_reason_event_uses_safe_reference_only() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 34),
+            &None,
+        );
+
+        let before = env.events().all().len();
+        let reason_ref = Symbol::new(&env, "review_rejected");
+        payroll_client.cancel_payroll_run(&admin, &run_id, &reason_ref);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), before + 2);
+        let event = events.get(before + 1).unwrap();
+
+        let topic0: Symbol = event.1.get(0).unwrap().try_into_val(&env).unwrap();
+        let topic1: Symbol = event.1.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic0, symbol_short!("payroll"));
+        assert_eq!(topic1, Symbol::new(&env, "run_cancelled"));
+
+        let payload: (u64, Symbol) = event.2.try_into_val(&env).unwrap();
+        assert_eq!(payload, (run_id, reason_ref));
+    }
+
+    #[test]
+    fn test_rejected_payroll_reason_failure_does_not_emit_event() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 35),
+            &None,
+        );
+
+        let before = env.events().all().len();
+        let attacker = Address::generate(&env);
+        let reason_ref = Symbol::new(&env, "review_rejected");
+        let result = payroll_client.try_cancel_payroll_run(&attacker, &run_id, &reason_ref);
+
+        assert!(result.is_err());
+        assert_eq!(env.events().all().len(), before);
+    }
 
     // ── Issue #159: canonical payroll state machine ──────────────────────────
 
@@ -2861,7 +3018,7 @@ mod tests {
             PayrollRunState::Submitted
         );
 
-        payroll_client.cancel_payroll_run(&admin, &run_id);
+        payroll_client.cancel_payroll_run(&admin, &run_id, &Symbol::new(&env, "review_rejected"));
         assert_eq!(
             payroll_client.get_payroll_run_state(&run_id),
             PayrollRunState::Cancelled
@@ -2883,7 +3040,7 @@ mod tests {
             &test_nonce(&env, 151),
             &None,
         );
-        payroll_client.cancel_payroll_run(&admin, &run_id);
+        payroll_client.cancel_payroll_run(&admin, &run_id, &Symbol::new(&env, "review_rejected"));
 
         let result = payroll_client.try_transition_payroll_run_state(
             &admin,
@@ -2959,7 +3116,7 @@ mod tests {
         );
 
         // Cancel the pending run
-        payroll_client.cancel_payroll_run(&admin, &run_id);
+        payroll_client.cancel_payroll_run(&admin, &run_id, &Symbol::new(&env, "review_rejected"));
 
         // Verify it's no longer pending
         assert!(payroll_client.get_pending_run(&run_id).is_none());
@@ -3484,7 +3641,7 @@ mod tests {
     #[test]
     fn test_deposit_with_unique_id_succeeds() {
         let env = Env::default();
-        let (payroll_client, _admin, treasury, treasury_owner, _employee) =
+        let (payroll_client, _admin, treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
         let deposit_id = BytesN::from_array(&env, &[1u8; 32]);
@@ -3495,7 +3652,7 @@ mod tests {
     #[should_panic(expected = "Deposit already processed")]
     fn test_deposit_replay_with_same_id_rejected() {
         let env = Env::default();
-        let (payroll_client, _admin, treasury, treasury_owner, _employee) =
+        let (payroll_client, _admin, treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
         let deposit_id = BytesN::from_array(&env, &[2u8; 32]);
@@ -3506,7 +3663,7 @@ mod tests {
     #[test]
     fn test_deposit_distinct_ids_both_succeed() {
         let env = Env::default();
-        let (payroll_client, _admin, treasury, treasury_owner, _employee) =
+        let (payroll_client, _admin, treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
         let id1 = BytesN::from_array(&env, &[3u8; 32]);
